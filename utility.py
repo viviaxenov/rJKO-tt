@@ -6,11 +6,11 @@ from scipy.stats import multivariate_normal
 import matplotlib.pyplot as plt
 import matplotlib.animation as ani
 import matplotlib.colors as colors
-import mplcursors
 
 import tt
 import tt.amen
 import tt.multifuncrs
+import tt.cross.rectcross
 
 from functools import cache
 from time import perf_counter
@@ -20,8 +20,12 @@ import os.path
 
 from typing import Literal, Callable, Tuple, List, Union
 
+from itertools import cycle
+
 
 np.seterr(all="raise")
+
+
 
 
 def crop_to_cube(xs: np.ndarray, L: np.float64) -> np.ndarray:
@@ -59,6 +63,38 @@ def tt_sum_multi_axis(a, axis=-1):
     return tt.vector.from_list(crs)
 
 
+def tt_take(a: tt.vector, indices: np.ndarray):
+    """
+    Slicing with a list of indices; needed for cross approximation algorithm
+
+    Args:
+        a (tt.vector): tensor-train with dimension D
+        indices (np.ndarray): array with shape [I, D] where I is the number of values to be taken
+    Returns:
+        np.ndarray: array of shape [I,] with values of a at said indices
+    """
+    return np.array([a[_idx] for _idx in indices])
+
+
+def get_grid_function(f: Callable, grid1d: np.ndarray):
+    """
+    Returns a restriction of f on a prescribed grid [grid1d]^d
+
+    Args:
+        f (Callable): function R^d -> R
+        grid1d (np.ndarray): unidimensional grid
+
+    Returns:
+        Callable: function that takes [I, d] array of integer indices and returns [I] array of [f(x_1^i, ... x_d^i))]
+    """
+
+    def _f_on_grid(indices: np.ndarray):
+
+        return f(grid1d[indices])
+
+    return _f_on_grid
+
+
 def tt_hadamard_product(tensor1: tt.vector, tensor2: tt.vector):
     t1_as_oper = tt.matrix.from_list(
         [
@@ -85,21 +121,72 @@ def tt_full_like(a_tt: tt.vector, fill_value: np.float64):
     )
 
 
-def div_KL(rho1: np.ndarray, rho2: np.ndarray, h_x: np.float64) -> np.float64:
-    dim = len(rho1.shape)
-    eps = 1.0 - np.sum(rho1) * h_x**dim
-    try:
-        V = (
-            np.sum((np.log(np.where(rho1 > 1e-15, rho1, 1e-15)) - np.log(rho2)) * rho1)
-            * h_x**dim
+def div_KL(
+    rho1: tt.vector, rho2: Union[np.ndarray, Callable], h_x: np.float64
+) -> np.float64:
+    dim = rho1.d
+    if isinstance(rho2, np.ndarray):
+
+        if isinstance(rho1, tt.vector):
+            rho1 = rho1.full()
+
+        eps = 1.0 - np.sum(rho1) * h_x**dim
+        try:
+            V = (
+                np.sum(
+                    (np.log(np.where(rho1 > 1e-15, rho1, 1e-15)) - np.log(rho2)) * rho1
+                )
+                * h_x**dim
+            )
+            return V + eps
+        except:
+            return -1.0
+
+    else:
+        print("Estimating KL err", flush=True)
+        log_quot = tt.cross.rectcross.cross(
+            lambda _S: np.log(np.maximum(tt_take(rho1, _S) / rho2(_S), 1e-15)),
+            tt_full_like(rho1, 0.0),
+            eps=1e-4,
+            nswp=5,
         )
-        return V + eps
-    except:
-        return -1.0
+        print("", flush=True)
+        return tt.dot(log_quot, rho1) * h_x**dim
 
 
-def div_L2(rho1: np.ndarray, rho2: np.ndarray, h_x: np.float64) -> np.float64:
-    return np.linalg.norm((rho1 - rho2).ravel(), ord=2)
+def KL_stupid(
+    eta: tt.vector, hat_eta: tt.vector, beta: np.float64, h_x: np.float64
+) -> np.float64:
+    dim = eta.d
+    log_quot = tt.multifuncrs2(
+        [eta],
+        lambda _x: np.log(np.maximum(1e-16, _x)),
+        eps=1e-5,
+        kickrank=2,
+        nswp=8,
+    )
+    rho = tt_hadamard_product(eta, hat_eta)
+
+    return -2.0 * beta * tt.dot(log_quot, rho) * h_x**dim
+
+
+def div_L2(
+    rho1: tt.vector, rho2: Union[np.ndarray, Callable], h_x: np.float64
+) -> np.float64:
+    dim = rho1.d
+    if isinstance(rho2, np.ndarray):
+        rho1 = rho1.full()
+        return np.linalg.norm((rho1 - rho2).ravel(), ord=2)
+    else:
+        print("Estimating L2 err", flush=True)
+        diff = tt.cross.rectcross.cross(
+            lambda _S: (tt_take(rho1, _S) - rho2(_S)),
+            tt_full_like(rho1, 0.0),
+            eps=1e-4,
+            kickrank=2,
+            nswp=5,
+        )
+        return np.sqrt(tt.dot(diff, diff))
 
 
 gauss_density_fn = lambda _x, _m, _sigma: np.exp(-0.5 * ((_x - _m) / _sigma) ** 2) / (
@@ -124,47 +211,39 @@ def tt_independent_gaussians(
     return rho
 
 
-def correlated_gaussians(
-    mean: np.ndarray, covariance: np.ndarray, grid: np.ndarray
+def get_correlated_gaussian_fn(
+    mean: np.ndarray,
+    covariance: np.ndarray,
 ) -> np.ndarray:
 
     dim = mean.shape[0]
     assert dim == covariance.shape[0] and dim == covariance.shape[1]
 
-    h_x = grid[1] - grid[0]
-
     precision = np.linalg.inv(covariance)
-    print(covariance)
+    scale = (2.0 * np.pi) ** (dim / 2.0) * np.linalg.det(covariance) ** 0.5
 
-    # x = np.stack(np.meshgrid(*((grid,) * dim)), axis=-1)
-    # rho = multivariate_normal(mean, covariance).pdf(x)
+    mean = mean.reshape((1, -1))
 
-    x = np.stack(
-        np.meshgrid(*((grid,) * dim)),
-    )
-    x_centered = x - mean.reshape((dim,) + (1,) * dim)
+    def _dens(x: np.ndarray):  # shape[0] = dim,
+        x_centered = x - mean
+        rho = (
+            np.exp(
+                -0.5 * np.einsum("...i,ij,...j->...", x_centered, precision, x_centered)
+            )
+            / scale
+        )
 
-    rho = np.exp(
-        -0.5 * np.einsum("i...,ij,j...->...", x_centered, precision, x_centered)
-    )
+        return rho
 
-    rho /= np.sum(rho) * h_x**dim
-
-    # TODO WHY IT SWAPS
-    rho = rho.swapaxes(0, 1)
-
-    return rho
+    return _dens
 
 
-def gaussian_mixture(
+def get_gaussian_mixture_fn(
     means: List[np.ndarray],
     covariances: List[Union[np.ndarray, np.float64]],
-    grid: np.ndarray,
     weights: np.ndarray = None,
 ):
     n_comp = len(means)
-    h_x = grid[1] - grid[0]
-    N = grid.shape[0]
     assert len(covariances) == n_comp
     if weights is not None:
         assert len(weights) == n_comp
@@ -174,7 +253,8 @@ def gaussian_mixture(
         weights = np.full((n_comp,), 1.0 / n_comp)
 
     dim = means[0].shape[0]
-    density = 0
+
+    comps = []
 
     for _i, mean in enumerate(means):
         assert mean.shape[0] == dim
@@ -188,33 +268,13 @@ def gaussian_mixture(
             else:
                 assert cov.shape[1] == dim
 
-        density += weights[_i] * correlated_gaussians(mean, cov, grid)
+        comps.append(get_correlated_gaussian_fn(mean, cov))
 
-    return density
+    def _density(x: np.ndarray):
+        comp_vals = np.stack([_comp(x) for _comp in comps])
+        return np.einsum("i,i...", weights, comp_vals)
 
-
-def smile_density_2d(grid: np.ndarray) -> np.ndarray:
-    xx, yy = np.meshgrid(grid, grid)
-    h_x = grid[1] - grid[0]
-    rho = (
-        np.where((np.abs(xx**2 - 1 - yy) < 4e-2) & (np.abs(xx) < 1.0), 1.0, 0.0)
-        + np.where((xx - 1.0) ** 2 + (yy - 1) ** 2 < 0.3**2, 1.0, 0.0)
-        + np.where((xx + 1.0) ** 2 + (yy - 1) ** 2 < 0.3**2, 1.0, 0.0)
-    )
-
-    rho /= np.sum(rho) * h_x**2
-
-    return rho
-
-
-def get_power_interp_fun(t1, t2, beta1, beta2):
-    alpha = (np.log(beta1) - np.log(beta2)) / (np.log(t1) - np.log(t2))
-    C = np.exp(
-        (np.log(t2) * np.log(beta1) - np.log(t1) * np.log(beta2))
-        / (np.log(t2) - np.log(t1))
-    )
-
-    return lambda _T: C * (_T) ** alpha
+    return _density
 
 
 def plot_1d_marginals(
@@ -293,11 +353,14 @@ def plot_2d_marginals(
     if marginals[0] > marginals[1]:
         density_marginal = density_marginal.T
 
-
     plot_fn = axs.contourf if fill else axs.contour
 
     contours = plot_fn(
-        *np.meshgrid(grid, grid, indexing='ij'), density_marginal, 10, *plot_args, **plot_kwargs
+        *np.meshgrid(grid, grid, indexing="ij"),
+        density_marginal,
+        10,
+        *plot_args,
+        **plot_kwargs,
     )
     return fig, axs
 
@@ -331,7 +394,7 @@ def plot_matrix_marginals(
                 density,
                 grid,
                 fig_and_axs=(fig, axs[_i, _j]),
-                marginals=(_j, _i),
+                marginals=(_i, _j),
                 cmap=cmap,
             )
             if sym:
@@ -339,7 +402,7 @@ def plot_matrix_marginals(
                     density,
                     grid,
                     fig_and_axs=(fig, axs[_j, _i]),
-                    marginals=(_i, _j),
+                    marginals=(_j, _i),
                     cmap=cmap,
                     fill=True,
                 )
@@ -442,6 +505,37 @@ def plots_gradient_flow(
             os.path.join(
                 fig_path,
                 f"gf_2d_marginals{marginals[0]}{marginals[1]}.pdf",
+            )
+        )
+    else:
+        plt.show()
+
+    return
+
+
+def plot_convergence(
+    Ts: List[np.float64],
+    err_stats: dict,
+    fig_path=None,
+):
+
+    time = np.cumsum(np.array([0.0] + Ts))
+    fig, axs = plt.subplots(1, 1)
+    markers = cycle(["*", "^", "s", "o"])
+
+    for _stat in err_stats:
+        axs.plot(time, err_stats[_stat], label=_stat, marker=next(markers))
+    axs.set_yscale("log")
+    axs.set_xlabel("Time")
+    axs.set_title("Convergence")
+    axs.legend()
+    axs.grid()
+
+    if fig_path is not None:
+        fig.savefig(
+            os.path.join(
+                fig_path,
+                "gf_covnergence.pdf",
             )
         )
     else:

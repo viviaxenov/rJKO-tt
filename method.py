@@ -7,6 +7,7 @@ from scipy.interpolate import RegularGridInterpolator
 import tt
 import tt.amen
 import tt.multifuncrs
+import tt.cross.rectcross
 
 from functools import cache
 from typing import Literal, Callable, Tuple, List
@@ -17,9 +18,10 @@ from utility import *
 np.seterr(all="raise")
 
 # TODO: make convenient submodule like rcParams in Matplotlib
-tt_precision = 1e-12
+tt_precision = 1e-13
 density_min = tt_precision
-global_max_rk = 15
+nonlinear_tol = 1e-6
+global_max_rk = 20
 
 # TODO: implement in Chebyshev basis
 # (or any other more meaningful basis)
@@ -107,25 +109,28 @@ def solve_hadamard_TT(eta: tt.vector, rho_0: tt.vector, hat_eta_initial=None):
     return hat_eta
 
 
-# TODO: make rho_infty Callable
-# TODO: support eta_initial, hat_eta_initial from previous iterations
 def solve_initial_condition(
     eta: tt.vector,
     rho_0: tt.vector,
-    method: Literal["amen", "cross", "full"] = "full",
+    method: Literal["amen", "cross", "full"] = "cross",
     hat_eta_initial: tt.vector = None,
 ):
+    print(f"\t\tSolving initial {method=}", flush=True)
 
     if method not in ["cross", "full"]:
         raise NotImplemented
 
     elif method == "cross":
-        hat_eta = tt.multifuncrs(
+        hat_eta = tt.multifuncrs2(
             [rho_0, eta],
             lambda _x: _x[:, 0, ...] / _x[:, 1, ...],
             y0=hat_eta_initial,
             verb=0,
+            eps=nonlinear_tol,
+            kickrank=2,
         )
+        print("\t\tRounding", flush=True)
+        hat_eta = hat_eta.round(eps=tt_precision, rmax=global_max_rk)
 
     elif method == "full":
         hat_eta = tt.vector(
@@ -139,40 +144,53 @@ def solve_initial_condition(
 
 def solve_terminal_condition(
     hat_eta: tt.vector,
-    rho_infty: np.ndarray,
+    rho_infty_on_grid: Callable,
     beta: np.float64,
-    method: Literal["cross", "full"] = "full",
+    method: Literal["cross", "full"] = "cross",
     eta_initial: tt.vector = None,
 ):
-
+    print(f"\t\tSolving terminal, {method=}", flush=True)
     if method not in ["cross", "full"]:
         raise NotImplemented
 
     elif method == "cross":
-        eta = tt.multifuncrs(
-            [rho_infty, hat_eta],
-            lambda _x: (_x[:, 0, ...] / _x[:, 1, ...]) ** (1.0 / (1.0 + 2.0 * beta)),
-            y0=eta_initial,
-            verb=0,
+        if eta_initial is None:
+            eta_initial = tt.rand(hat_eta.n, r=hat_eta.r)
+        eta = tt.cross.rectcross.cross(
+            lambda _I: (rho_infty_on_grid(_I) / np.maximum(tt_take(hat_eta, _I), density_min))
+            ** (1.0 / (1.0 + 2.0 * beta)),
+            eta_initial,
+            eps=nonlinear_tol,
+            kickrank=2,
+            verbose=False,
         )
+
+        print("\t\tRounding", flush=True)
+        eta = eta.round(eps=tt_precision, rmax=global_max_rk)
 
     else:
         eta = tt.vector(
-            ((rho_infty) / (np.maximum(hat_eta.full(), density_min)))
+            ((rho_infty_on_grid) / (np.maximum(hat_eta.full(), density_min)))
             ** (1.0 / (1.0 + 2.0 * beta)),
             eps=tt_precision,
         )
 
+    # print(eta)
+    # print("Solving terminal done")
     return eta
 
 
 def fixed_point_inner_cycle(
     eta: tt.vector,
     rho_0: tt.vector,
-    rho_infty: np.ndarray,
+    rho_infty: Union[Callable, np.ndarray],
     grid: np.ndarray,
     beta: np.float64,
     T: np.float64,
+    initial_method="cross",
+    terminal_method="cross",
+    start_value_init: tt.vector = None,
+    start_value_term: tt.vector = None,
 ):
     # Assuming that the whole grid is a Cartesian product of d identical uniform grids
     #
@@ -184,6 +202,8 @@ def fixed_point_inner_cycle(
     hat_eta_t0 = solve_initial_condition(
         eta_t0,
         rho_0,
+        method=initial_method,
+        hat_eta_initial=start_value_init,
     )  # (4.5.3)
     # TODO: A. proper linear solver
     #       B. get inital value from previous step
@@ -193,6 +213,8 @@ def fixed_point_inner_cycle(
         hat_eta_next,
         rho_infty,
         beta,
+        method=terminal_method,
+        eta_initial=start_value_term,
     )
 
     return eta_next, hat_eta_next, eta_t0, hat_eta_t0
@@ -242,54 +264,124 @@ def fixed_point_aitken(
     return x_new, relaxation_new
 
 
+def init_step(
+    rho_0: tt.vector, eta: tt.vector, hat_eta: tt.vector
+) -> Tuple[tt.vector, tt.vector, tt.vector,]:
+
+    if rho_0 is None:
+        if eta is None or hat_eta is None:
+            raise ValueError("Specify initial conditions")
+        else:
+            rho_0 = tt_hadamard_product(eta, hat_eta)
+
+    else:
+        if eta is None and hat_eta is None:
+            eta = tt.multifuncrs2([rho_0], lambda _x: np.sqrt(_x), verb=False)
+
+        elif eta is None:
+            eta = tt.multifuncrs2(
+                [rho_0, hat_eta], lambda _x: _x[:, 0] / _x[:, 1], verb=False
+            )
+        elif hat_eta is None:
+            hat_eta = tt.multifuncrs2(
+                [rho_0, eta], lambda _x: _x[:, 0] / _x[:, 1], verb=False
+            )
+
+        # else:
+        #     assert (
+        #         tt.vector.norm(tt_hadamard_product(eta, hat_eta) - rho_0)/tt.vector.norm(rho_0) < 1e-8
+        #     ), "Initial values don't match; eta*hat_eta != rho_0"
+
+    return rho_0, eta, hat_eta
+
+
 def regularized_JKO_step(
-    rho_0: tt.vector,
-    rho_infty: np.ndarray,  # TODO: MAKE CALLABLE
+    rho_infty: Callable,
     grid: np.ndarray,  # Unidimensional
     beta: np.float64,
     T: np.float64,
+    terminal_method: Literal["cross", "full"] = "cross",
     fp_method: Literal["picard", "aitken"] = "picard",
-    fp_relaxation: np.float64 = 1.0,
+    fp_relaxation: np.float64 = 1.,
     fp_max_rank: int = global_max_rk,
-    fp_max_iter: int = 500,
-    stopping_rtol: np.float64 = 1e-4,
+    fp_max_iter: int = 100,
+    fp_stopping_rtol: np.float64 = 1e-4,
     etas_init: Tuple[tt.vector, tt.vector] = None,
+    rho_0: tt.vector = None,
     debug=False,
 ) -> Tuple[tt.vector, tt.vector]:
 
-    dim = len(rho_infty.shape)
+    dim = rho_0.d
     h_x = grid[1] - grid[0]
     N = grid.shape[0]
 
-    if etas_init in [(None, None), None]:
-        eta_cur = tt_full_like(rho_0, 1.0)
-        hat_eta_cur = rho_0.copy()
-    else:
-        eta_cur, hat_eta_cur = etas_init
+    rho_0, eta_init, hat_eta_init = init_step(
+        rho_0,
+        *etas_init,
+    )
+
+    start_value_init = hat_eta_init
+    start_value_terminal = eta_init
 
     fixed_point_update = (
         fixed_point_aitken if fp_method == "aitken" else fixed_point_picard
     )
 
-    # rho_norm = tt.sum(hadamard_product(eta_cur, hat_eta_cur)) * h_x**dim
+    rho_inf_on_grid = (
+        rho_infty(np.stack(np.meshgrid(*(grid,) * dim), axis=-1))
+        if terminal_method == "full"
+        else get_grid_function(rho_infty, grid)
+    )
+
+    eta_cur = eta_init
+    try:
+        print("\tInitializing FP")
+        tilde_eta_cur, hat_eta_cur, eta_t0, hat_eta_t0 = fixed_point_inner_cycle(
+            eta_cur,
+            rho_0,
+            rho_inf_on_grid,
+            grid,
+            beta,
+            T,
+            terminal_method=terminal_method,
+            start_value_init=start_value_init,
+            start_value_term=start_value_terminal,
+        )
+    except (RuntimeWarning, RuntimeError, FloatingPointError) as e:
+        print(
+            "".join(traceback.TracebackException.from_exception(e).format()),
+            flush=True,
+        )
+
+        if debug:
+            raise RuntimeError(
+                eta_cur, hat_eta_cur, abs_errors, rel_errors, relaxations, ranks
+            )
+        else:
+            raise RuntimeError(eta_cur, hat_eta_cur)
 
     eta_prev = eta_cur
-    tilde_eta_prev, *_ = fixed_point_inner_cycle(
-        eta_prev, rho_0, rho_infty, grid, beta, T
-    )
+    tilde_eta_prev = tilde_eta_cur
 
     rho_norm = tt.sum(rho_0) * h_x**dim
     abs_errors = []
     rel_errors = []
     relaxations = []
     ranks = []
-    rho_cur = tt_hadamard_product(eta_cur, hat_eta_cur)
-    rho_norm = tt.sum(rho_cur) * h_x**dim
 
     for _i in range(fp_max_iter):
+        print(f"\tStarting FP step {_i + 1}", flush=True)
         try:
             tilde_eta_cur, hat_eta_cur, eta_t0, hat_eta_t0 = fixed_point_inner_cycle(
-                eta_cur, rho_0, rho_infty, grid, beta, T
+                eta_cur,
+                rho_0,
+                rho_inf_on_grid,
+                grid,
+                beta,
+                T,
+                terminal_method=terminal_method,
+                start_value_init=start_value_init,
+                start_value_term=start_value_terminal,
             )
         except (RuntimeWarning, RuntimeError, FloatingPointError) as e:
             print(
@@ -304,6 +396,9 @@ def regularized_JKO_step(
             else:
                 raise RuntimeError(eta_cur, hat_eta_cur)
 
+        start_value_init = hat_eta_t0
+        start_value_term = eta_cur
+
         abs_err = tt.vector.norm(tilde_eta_cur - eta_cur)
         rel_err = abs_err / tt.vector.norm(eta_cur)
         rk = np.max(eta_cur.r)
@@ -313,7 +408,7 @@ def regularized_JKO_step(
         relaxations.append(fp_relaxation)
         ranks.append(rk)
 
-        if rel_err <= stopping_rtol:
+        if rel_err <= fp_stopping_rtol:
             break
 
         eta_next, fp_relaxation = fixed_point_update(
@@ -330,26 +425,8 @@ def regularized_JKO_step(
 
         eta_cur = eta_next
 
-        eta_norm = tt.sum(eta_cur) * h_x**dim
-        hat_eta_norm = tt.sum(hat_eta_cur) * h_x**dim
-
-        fh_eta = hat_eta_cur.full()
-        he_min = fh_eta.min()
-        he_max = fh_eta.max()
-
-        f_eta = eta_cur.full()
-        e_min = f_eta.min()
-        e_max = f_eta.max()
-
-        # print(
-        #     # f"{_i:-4d} {rel_err=:.2e} {eta_norm=:.2e} {hat_eta_norm=:.2e} {rho_norm=:.2e} {e_min=:+.2e} {e_max=:.2e} {he_min=:+.2e} {he_max=:.2e} {rk=:-4.2f}"
-        #     f"{_i:-4d} {rel_err=:.2e} {1. - rho_norm=:.2e} {rho_min=:+.2e} {e_min=:+.2e} {e_max=:.2e} {he_min=:+.2e} {he_max=:.2e} {rk=:-4.2f}"
-        # )
-
-    dKL = div_KL(rho_cur.full(), rho_infty, h_x)
-    print(
-        f"n_iterations = {_i:-4d}; {rel_err=:.2e} {1. - rho_norm=:.2e} {T=:-2.04f} {beta=:.04f} rk={ranks[-1]:-2d} {dKL=:.2e}"
-    )
+    # TODO: this is very lazy
+    res_str = f"n_iterations = {_i:-4d}; {T=:-2.04f} {beta=:.04f} rk={ranks[-1]:-2d} "
 
     if debug:
         return (
@@ -363,7 +440,7 @@ def regularized_JKO_step(
             ranks,
         )
     else:
-        return eta_cur, hat_eta_cur, eta_t0, hat_eta_t0
+        return eta_cur, hat_eta_cur, eta_t0, hat_eta_t0, res_str
 
 
 # TODO do w.o. full
@@ -446,27 +523,32 @@ def calculate_vector_fields(
 # TODO: not the best name exactly
 def gradient_flow(
     rho_0: tt.vector,
-    rho_infty: np.ndarray,  # TODO: MAKE CALLABLE
+    rho_infty: Callable,
     grid: np.ndarray,  # Unidimensional
     Ts: List[np.float64],
     betas: List[np.float64],
-    stopping_KL=1e-4,
+    stopping_rtol=1e-4,
     ode_T_max=None,
     ode_time_splits=None,
 ):
 
     assert len(Ts) == len(betas)
-    dim = len(rho_infty.shape)
+    dim = rho_0.d
     h_x = grid[1] - grid[0]
     N = grid.shape[0]
 
     eta_cur = None
     hat_eta_cur = None
-    rho_cur = rho_0
+    rho_cur = rho_0.copy()
 
     rhos = [rho_0]
-    dKL = [div_KL(rho_cur.full(), rho_infty, h_x)]
-    dL2 = [div_L2(rho_cur.full(), rho_infty, h_x)]
+    rho_inf_on_grid = get_grid_function(rho_infty, grid)
+    dKL = [div_KL(rho_cur, rho_inf_on_grid, h_x)]
+    dKL_est = [
+        dKL[-1]
+    ]  # could do it, but nice initialization of eta, hat_eta is inside initial/terminal, so who cares about 1st one
+    dL2 = [div_L2(rho_cur, rho_inf_on_grid, h_x)]
+    rL2 = [dL2[0] / tt.vector.norm(rho_cur)]
     vector_fields = []
 
     stop = False
@@ -474,8 +556,14 @@ def gradient_flow(
         beta = betas[_iter]
 
         try:
-            eta_cur, hat_eta_cur, eta_t0, hat_eta_t0 = regularized_JKO_step(
-                rho_cur, rho_infty, grid, beta, T, etas_init=(eta_cur, hat_eta_cur)
+            print(f"Starting GF step {_iter + 1}", flush=True)
+            eta_cur, hat_eta_cur, eta_t0, hat_eta_t0, res_str = regularized_JKO_step(
+                rho_infty,
+                grid,
+                beta,
+                T,
+                etas_init=(eta_cur, hat_eta_cur),
+                rho_0=rho_cur,
             )
         except RuntimeError as e:
             eta_cur, hat_eta_cur = e.args
@@ -483,10 +571,16 @@ def gradient_flow(
 
         rho_cur = tt_hadamard_product(eta_cur, hat_eta_cur)
         rho_cur *= 1.0 / (tt.sum(rho_cur) * h_x**dim)
-        rcf = rho_cur.full()
 
-        dKL.append(div_KL(rcf, rho_infty, h_x))
-        dL2.append(div_L2(rcf, rho_infty, h_x))
+        dKL.append(div_KL(rho_cur, rho_inf_on_grid, h_x))
+        dL2.append(div_L2(rho_cur, rho_inf_on_grid, h_x))
+        rL2.append(dL2[-1] / tt.vector.norm(rho_cur))
+        dKL_est.append(KL_stupid(eta_cur, hat_eta_cur, beta, h_x))
+
+        print(
+            f"{res_str} dKL={dKL[-1]:.2e} dL2={dL2[-1]:.2e} rel. err L2={rL2[-1]:.2e}"
+        )
+
         # rhos.append(rho_cur)
         if ode_T_max is not None and T > ode_T_max:
             ode_time_splits = int(np.ceil(np.log2(T / ode_T_max)))
@@ -496,14 +590,22 @@ def gradient_flow(
                 eta_t0, hat_eta_t0, eta_cur, hat_eta_cur, grid, beta, T, ode_time_splits
             )
 
-        stop = stop or (dKL[-1] <= stopping_KL) or (dKL[-1] > 1.5 * dKL[-2])
+        stop = stop or (rL2[-1] <= stopping_rtol) or (rL2[-1] > 2.0 * rL2[-2])
         if stop:
             break
 
     rhos.append(rho_cur)
+
+    err_stats = {
+        "KL": dKL,
+        "L2": dL2,
+        "rel.L2": rL2,
+        "KL_est": dKL_est,
+    }
+
     if ode_time_splits:
-        return rhos, dKL, dL2, vector_fields
-    return rhos, dKL, dL2
+        return rhos, err_stats, vector_fields
+    return rhos, err_stats
 
 
 def _ode_step_explicit_Euler(
